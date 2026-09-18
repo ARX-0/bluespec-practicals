@@ -1,0 +1,15 @@
+# Bluesim/bsc build artifacts
+outputs/
+Build/
+*.bo
+*.ba
+*.cxx
+*.h
+*.o
+*.so
+*.log
+*.vcd
+*.sav
+*.tiff
+sim
+vsim

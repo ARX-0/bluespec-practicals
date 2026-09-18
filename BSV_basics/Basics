@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# ============================================================================
+# Basics -- the BSV_basics build-and-check engine.
+#
+#   Basics                 check the problem directory you are standing in
+#   Basics 07              check problem 07 from anywhere
+#   Basics 07_Pack_Unpack  same, by full name
+#   Basics all             regression over every problem, refresh PROGRESS.md
+#   Basics --list          the ladder with current status
+#   Basics -v              check through generated Verilog + iverilog
+#   Basics -w              also dump outputs/dump.vcd
+#   Basics -c              clean build artifacts (add `all` for every problem)
+#   Basics -h              this help
+#
+# Deliberately a near-copy of BSVbits/Run -- same engine, different ladder.
+# ============================================================================
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# ---------------------------------------------------------------- colours
+if [ -t 1 ]; then
+   B=$'\033[1m'; DIM=$'\033[2m'; R=$'\033[0m'
+   RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYA=$'\033[36m'
+else
+   B=''; DIM=''; R=''; RED=''; GRN=''; YEL=''; CYA=''
+fi
+
+die () { echo "${RED}Basics:${R} $*" >&2; exit 2; }
+
+# ---------------------------------------------------------------- toolchain
+# Find bsc without relying on the user's PATH or ~/.bashrc.
+if ! command -v bsc >/dev/null 2>&1; then
+   for cand in "$HOME/bsc/inst/bin" /opt/bsc/bin /usr/local/bsc/bin; do
+      [ -x "$cand/bsc" ] && { export PATH="$PATH:$cand"; break; }
+   done
+fi
+command -v bsc >/dev/null 2>&1 || die "cannot find 'bsc' on PATH. Install bsc or add it to PATH."
+
+if [ -z "${BLUESPECDIR:-}" ]; then
+   BSC_BIN="$(dirname "$(readlink -f "$(command -v bsc)")")"
+   export BLUESPECDIR="$(cd "$BSC_BIN/../lib" && pwd)"
+fi
+
+# NOTE: this bsc build has no %/Prelude directory -- Prelude lives inside
+# %/Libraries. Adding %/Prelude produces a warning on every single compile.
+BSC_PATH_SUFFIX='%/Libraries'
+BSC_FLAGS="-keep-fires -aggressive-conditions -no-warn-action-shadowing"
+
+SIM_TIMEOUT=60      # backstop for a deadlocked design; the in-BSV watchdog
+                    # should normally fire first with a better message.
+
+# ---------------------------------------------------------------- args
+MODE=bluesim; DUMP_VCD=0; CLEAN=0; TARGET=""; DO_ALL=0; DO_LIST=0
+
+while [ $# -gt 0 ]; do
+   case "$1" in
+      -v|--verilog) MODE=verilog ;;
+      -w|--waves)   DUMP_VCD=1 ;;
+      -c|--clean)   CLEAN=1 ;;
+      -l|--list|--ladder) DO_LIST=1 ;;
+      all|--all)    DO_ALL=1 ;;
+      -h|--help)    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+      -*)           die "unknown option '$1' (try: Basics -h)" ;;
+      *)            TARGET="$1" ;;
+   esac
+   shift
+done
+
+# ---------------------------------------------------------------- problems
+# A problem directory is NN_Name containing Top.bsv and .check/Testbench.bsv.
+list_problems () {
+   find "$ROOT" -maxdepth 1 -mindepth 1 -type d -name '[0-9][0-9]_*' \
+      -printf '%f\n' 2>/dev/null | sort
+}
+
+# Resolve a user-supplied target ("07", "07_Rule_Guards") to a directory name.
+resolve_problem () {
+   local want="$1" hits
+   hits="$(list_problems | grep -E "^${want}(_|$)" || true)"
+   [ -z "$hits" ] && hits="$(list_problems | grep -iF "$want" || true)"
+   local n; n="$(printf '%s' "$hits" | grep -c . || true)"
+   if [ "$n" -eq 0 ]; then
+      echo "${RED}Basics:${R} no problem matches '$want'. Try: Basics --list" >&2; return 1
+   elif [ "$n" -gt 1 ]; then
+      echo "${RED}Basics:${R} '$want' is ambiguous:" >&2
+      printf '%s\n' "$hits" | sed 's/^/    /' >&2; return 1
+   fi
+   printf '%s' "$hits"
+}
+
+# If no target given, are we standing inside a problem directory?
+problem_from_cwd () {
+   local d; d="$(pwd -P)"
+   while [ "$d" != "/" ]; do
+      if [[ "$(basename "$d")" =~ ^[0-9][0-9]_ ]] && [ "$(dirname "$d")" = "$ROOT" ]; then
+         basename "$d"; return 0
+      fi
+      d="$(dirname "$d")"
+   done
+   return 1
+}
+
+# ---------------------------------------------------------------- progress
+stamp_progress () {
+   local prob="$1" verdict="$2" pfile="$ROOT/PROGRESS.md"
+   [ -f "$pfile" ] || return 0
+   local mark today
+   case "$verdict" in
+      PASS)  mark='`PASS`' ;;
+      FAIL)  mark='`FAIL`' ;;
+      ERROR) mark='`ERROR`' ;;
+      *)     mark='`-`' ;;
+   esac
+   today="$(date +%Y-%m-%d)"
+   # Rewrite the Status and Last-run cells of this problem's row, leaving the
+   # rest of the table (and the file) untouched.
+   awk -v prob="$prob" -v mark="$mark" -v today="$today" '
+      BEGIN { FS="|"; OFS="|" }
+      index($0, "`" prob "`") && /^\|/ {
+         n = split($0, f, "|")
+         f[n-2] = " " mark " "
+         f[n-1] = " " today " "
+         line = ""
+         for (i = 2; i < n; i++) line = line "|" f[i]
+         print line "|"
+         next
+      }
+      { print }
+   ' "$pfile" > "$pfile.tmp" && mv "$pfile.tmp" "$pfile"
+}
+
+# ---------------------------------------------------------------- the check
+# Echoes one of PASS / FAIL / ERROR on stdout; human output goes to stderr.
+check_problem () {
+   local prob="$1" quiet="${2:-0}"
+   local dir="$ROOT/$prob"
+   local out="$dir/outputs" bld="$dir/outputs/build" log="$dir/outputs/run.log"
+
+   [ -f "$dir/Top.bsv" ]             || { echo "ERROR"; echo "${RED}missing Top.bsv in $prob${R}" >&2; return; }
+   [ -f "$dir/.check/Testbench.bsv" ]|| { echo "ERROR"; echo "${RED}missing .check/Testbench.bsv in $prob${R}" >&2; return; }
+
+   # Always build from scratch. bsc caches .bo files and only reports
+   # scheduling warnings on a compile that actually happens -- so an
+   # incremental rebuild silently drops the very diagnostic that explains
+   # the failure. These designs take a second to build; determinism wins.
+   rm -rf "$bld" "$dir/outputs/verilog"
+   mkdir -p "$bld"
+   : > "$log"
+
+   local paths=".:.check:$ROOT/common:$BSC_PATH_SUFFIX"
+   local rc verdict
+
+   if [ "$MODE" = bluesim ]; then
+      {
+         echo "=== bsc compile (Bluesim) ==="
+         ( cd "$dir" && bsc -u -sim -simdir outputs/build -bdir outputs/build \
+              -info-dir outputs/build $BSC_FLAGS -p "$paths" \
+              -g mkTestbench .check/Testbench.bsv 2>&1 )
+      } >> "$log" 2>&1
+      rc=$?
+      if [ $rc -ne 0 ]; then verdict=ERROR; else
+         {
+            echo "=== bsc link (Bluesim) ==="
+            ( cd "$dir" && bsc -e mkTestbench -sim -o outputs/build/sim \
+                 -simdir outputs/build -bdir outputs/build -info-dir outputs/build \
+                 -keep-fires -p "$paths" 2>&1 )
+         } >> "$log" 2>&1
+         rc=$?
+      fi
+      if [ $rc -eq 0 ]; then
+         local vflag=()
+         [ "$DUMP_VCD" = 1 ] && vflag=(-V "outputs/dump.vcd")
+         { echo "=== simulation ==="
+           ( cd "$dir" && timeout "$SIM_TIMEOUT" ./outputs/build/sim "${vflag[@]}" 2>&1 )
+         } >> "$log" 2>&1
+         rc=$?
+      fi
+   else
+      local vdir="$dir/outputs/verilog"
+      mkdir -p "$vdir"
+      {
+         echo "=== bsc compile (Verilog) ==="
+         ( cd "$dir" && bsc -u -verilog -vdir outputs/verilog -bdir outputs/build \
+              -info-dir outputs/build $BSC_FLAGS -p "$paths" \
+              -g mkTestbench .check/Testbench.bsv 2>&1 )
+      } >> "$log" 2>&1
+      rc=$?
+      if [ $rc -ne 0 ]; then verdict=ERROR; else
+         {
+            echo "=== bsc link (iverilog) ==="
+            ( cd "$dir" && bsc -e mkTestbench -verilog -o outputs/build/vsim \
+                 -vdir outputs/verilog -bdir outputs/build -info-dir outputs/build \
+                 -keep-fires -vsim iverilog -p "$paths" 2>&1 )
+         } >> "$log" 2>&1
+         rc=$?
+      fi
+      if [ $rc -eq 0 ]; then
+         # bsc bakes a `#!/usr/bin/vvp` shebang into the generated runner, but
+         # vvp may live elsewhere (e.g. ~/.local/bin), so invoke it by name.
+         local vcdarg=()
+         [ "$DUMP_VCD" = 1 ] && vcdarg=(+bscvcd)
+         { echo "=== simulation (iverilog) ==="
+           ( cd "$dir" && timeout "$SIM_TIMEOUT" vvp outputs/build/vsim "${vcdarg[@]}" 2>&1 )
+         } >> "$log" 2>&1
+         rc=$?
+      fi
+   fi
+
+   # ---- verdict
+   if [ "${verdict:-}" = ERROR ] || [ $rc -eq 124 ] || ! grep -q '^RESULT: ' "$log"; then
+      if [ $rc -eq 124 ]; then
+         verdict=FAIL
+         echo "${RED}  simulation killed after ${SIM_TIMEOUT}s -- deadlock.${R}" >&2
+      else
+         verdict=ERROR
+      fi
+   elif grep -q '^RESULT: PASS' "$log"; then
+      verdict=PASS
+   else
+      verdict=FAIL
+   fi
+
+   if [ "$quiet" != 1 ]; then
+      echo "" >&2
+      case "$verdict" in
+         ERROR)
+            echo "${B}${RED}  BUILD ERROR${R}  $prob" >&2
+            echo "" >&2
+            echo "${DIM}  bsc says (this message is the lesson -- read it closely):${R}" >&2
+            echo "" >&2
+            # Show bsc's diagnostics verbatim; they are the main teaching signal.
+            grep -E '^(Error|Warning)' -A 12 "$log" | sed 's/^/  /' >&2 \
+               || tail -30 "$log" | sed 's/^/  /' >&2
+            ;;
+         FAIL)
+            sed -n '/=== simulation/,$p' "$log" | sed '1d' >&2
+            echo "${B}${RED}  FAIL${R}  $prob" >&2
+            # Scheduling warnings are warnings, not errors, so the build
+            # succeeded -- but "rule can never fire" is very often the actual
+            # explanation for the mismatch above. Surface it.
+            if grep -qE '\(G00(10|21|36|39)\)' "$log"; then
+               echo "" >&2
+               echo "${YEL}  bsc also warned about the SCHEDULE -- this is very likely your bug:${R}" >&2
+               echo "" >&2
+               # A bsc diagnostic is a "Warning:" line plus the indented
+               # lines under it; print whole blocks, nothing else.
+               awk '/^Warning:/ { inw = 1 } 
+                    inw && /^[^ \t]/ && !/^Warning:/ { inw = 0 }
+                    inw { print "  " $0 }' "$log" >&2
+            fi
+            ;;
+         PASS)
+            sed -n '/=== simulation/,$p' "$log" | sed '1d' >&2
+            echo "${B}${GRN}  PASS${R}  $prob" >&2
+            ;;
+      esac
+      echo "" >&2
+      echo "${DIM}  log: $prob/outputs/run.log${R}" >&2
+      if [ "$DUMP_VCD" = 1 ] && [ -f "$dir/outputs/dump.vcd" ]; then
+         echo "${DIM}  vcd: gtkwave $dir/outputs/dump.vcd${R}" >&2
+      fi
+      echo "" >&2
+   fi
+
+   stamp_progress "$prob" "$verdict"
+   echo "$verdict"
+}
+
+clean_problem () {
+   rm -rf "$ROOT/$1/outputs"
+   echo "  cleaned $1"
+}
+
+# ---------------------------------------------------------------- dispatch
+if [ "$DO_LIST" = 1 ]; then
+   echo ""
+   echo "${B}BSV_basics ladder${R}"
+   echo ""
+   for p in $(list_problems); do
+      st="${DIM}not attempted${R}"
+      lg="$ROOT/$p/outputs/run.log"
+      if [ -f "$lg" ]; then
+         if grep -q '^RESULT: PASS' "$lg"; then st="${GRN}PASS${R}"
+         elif grep -q '^RESULT: FAIL' "$lg"; then st="${RED}FAIL${R}"
+         else st="${YEL}build error${R}"; fi
+      fi
+      printf '  %-30s %s\n' "$p" "$st"
+   done
+   echo ""
+   exit 0
+fi
+
+if [ "$CLEAN" = 1 ]; then
+   if [ "$DO_ALL" = 1 ]; then
+      for p in $(list_problems); do clean_problem "$p"; done
+   else
+      prob="${TARGET:+$(resolve_problem "$TARGET")}" || exit 1
+      [ -z "$prob" ] && { prob="$(problem_from_cwd)" || die "not in a problem directory"; }
+      clean_problem "$prob"
+   fi
+   exit 0
+fi
+
+if [ "$DO_ALL" = 1 ]; then
+   echo ""
+   echo "${B}BSV_basics regression${R}  (${MODE})"
+   echo ""
+   npass=0; nfail=0; nerr=0
+   for p in $(list_problems); do
+      v="$(check_problem "$p" 1 2>/dev/null)"
+      case "$v" in
+         PASS)  printf '  %s%-6s%s %s\n' "$GRN" "PASS"  "$R" "$p"; npass=$((npass+1)) ;;
+         FAIL)  printf '  %s%-6s%s %s\n' "$RED" "FAIL"  "$R" "$p"; nfail=$((nfail+1)) ;;
+         *)     printf '  %s%-6s%s %s\n' "$YEL" "ERROR" "$R" "$p"; nerr=$((nerr+1))  ;;
+      esac
+   done
+   echo ""
+   echo "  ${GRN}${npass} passed${R}, ${RED}${nfail} failed${R}, ${YEL}${nerr} build errors${R}"
+   echo "  PROGRESS.md updated."
+   echo ""
+   [ $((nfail + nerr)) -eq 0 ]
+   exit $?
+fi
+
+# Single problem: explicit target, else infer from cwd.
+if [ -n "$TARGET" ]; then
+   prob="$(resolve_problem "$TARGET")" || exit 1
+else
+   prob="$(problem_from_cwd)" || die "not inside a problem directory.
+    Either cd into one (e.g. cd $ROOT/01_Hello_Method)
+    or name it:  Basics 07     Try 'Basics --list' to see the ladder."
+fi
+
+echo ""
+echo "${CYA}${B}  $prob${R}  ${DIM}(${MODE})${R}"
+v="$(check_problem "$prob")"
+[ "$v" = PASS ]
